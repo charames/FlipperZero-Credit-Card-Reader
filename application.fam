@@ -1,0 +1,14 @@
+App(
+    appid="credit_card_reader",
+    name="Credit Card Reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="credit_card_reader_app",
+    requires=["gui"],
+    stack_size=3 * 1024,
+    fap_icon="icon.png",
+    fap_category="NFC",
+    fap_author="charames",
+    fap_weburl="https://github.com/charames/FlipperZero-Credit-Card-Reader",
+    fap_description="Reads and displays the PAN, expiry, cardholder name and issuer info from a contactless EMV bank card, the way the built-in NFC app used to before EMV reading was removed in 2023.",
+    fap_version="1.0",
+)
