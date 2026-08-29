@@ -7,6 +7,18 @@
 #define EMV_PAN_MAX_DIGITS (19)
 #define EMV_NAME_MAX_LEN (26)
 
+#define EMV_RAW_FIELD_MAX (48)
+#define EMV_RAW_VALUE_MAX (24)
+
+/** One raw BER-TLV data element as returned by the card, tag + value bytes,
+ * kept for display alongside the curated fields above. Constructed (template)
+ * tags are not recorded, only their leaf contents. */
+typedef struct {
+    uint16_t tag;
+    uint8_t length; /**< Original length; may exceed EMV_RAW_VALUE_MAX if truncated. */
+    uint8_t value[EMV_RAW_VALUE_MAX];
+} EmvRawField;
+
 typedef enum {
     EmvReadResultSuccess, /**< PAN (and usually more) was read successfully. */
     EmvReadResultNoPan, /**< An EMV application was found and started, but no PAN could be read. */
@@ -34,4 +46,7 @@ typedef struct {
 
     uint16_t currency_code;
     bool currency_found;
+
+    EmvRawField raw_fields[EMV_RAW_FIELD_MAX];
+    uint8_t raw_field_count;
 } EmvCardData;

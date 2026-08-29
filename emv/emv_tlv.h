@@ -29,8 +29,11 @@ void emv_tlv_walk(const uint8_t* data, size_t len, EmvTlvVisitor visitor, void* 
  */
 bool emv_tlv_find(const uint8_t* data, size_t len, uint16_t tag, EmvTlv* out_tlv);
 
-/** Parses a Data Object List (DOL, e.g. a PDOL) and returns the total byte length
- * of the values that would need to be supplied for it (a DOL only lists tag+length
- * pairs, no values).
+/** Visitor callback invoked for every (tag, length) entry in a Data Object List. */
+typedef bool (*EmvDolVisitor)(uint16_t tag, uint8_t length, void* context);
+
+/** Walks a Data Object List, invoking visitor for each tag+length entry in order.
+ * Unlike TLV records, a DOL entry's length is always a single byte (EMV Book 3),
+ * and there is no value present in the list itself.
  */
-size_t emv_dol_value_length(const uint8_t* dol, size_t dol_len);
+void emv_dol_walk(const uint8_t* dol, size_t dol_len, EmvDolVisitor visitor, void* context);

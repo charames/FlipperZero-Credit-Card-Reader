@@ -33,7 +33,7 @@ size_t emv_apdu_build_select_aid(uint8_t* buf, const uint8_t* aid, uint8_t aid_l
     return pos;
 }
 
-size_t emv_apdu_build_gpo(uint8_t* buf, size_t pdol_value_len) {
+size_t emv_apdu_build_gpo(uint8_t* buf, const uint8_t* pdol_value, size_t pdol_value_len) {
     if(pdol_value_len > 250) return 0;
 
     size_t pos = 0;
@@ -44,7 +44,7 @@ size_t emv_apdu_build_gpo(uint8_t* buf, size_t pdol_value_len) {
     buf[pos++] = (uint8_t)(pdol_value_len + 2); /* Lc: template tag+len+value */
     buf[pos++] = 0x83; /* Command Template tag */
     buf[pos++] = (uint8_t)pdol_value_len;
-    memset(buf + pos, 0x00, pdol_value_len);
+    if(pdol_value_len > 0) memcpy(buf + pos, pdol_value, pdol_value_len);
     pos += pdol_value_len;
     buf[pos++] = 0x00; /* Le */
     return pos;

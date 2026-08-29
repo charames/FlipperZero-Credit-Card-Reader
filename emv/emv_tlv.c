@@ -109,23 +109,24 @@ bool emv_tlv_find(const uint8_t* data, size_t len, uint16_t tag, EmvTlv* out_tlv
     return ctx.found;
 }
 
-size_t emv_dol_value_length(const uint8_t* dol, size_t dol_len) {
+void emv_dol_walk(const uint8_t* dol, size_t dol_len, EmvDolVisitor visitor, void* context) {
     const uint8_t* pos = dol;
     const uint8_t* end = dol + dol_len;
-    size_t total = 0;
 
     while(pos < end) {
-        uint8_t first = *pos++;
-        if((first & 0x1F) == 0x1F) {
+        uint16_t tag = *pos++;
+        if((tag & 0x1F) == 0x1F) {
             if(pos >= end) break;
             uint8_t second = *pos++;
+            tag = (tag << 8) | second;
             while((second & 0x80) && pos < end) {
                 second = *pos++;
             }
         }
         if(pos >= end) break;
-        total += *pos++;
-    }
+        uint8_t length = *pos++;
 
-    return total;
+        if(!visitor(tag, length, context)) return;
+    }
 }
+

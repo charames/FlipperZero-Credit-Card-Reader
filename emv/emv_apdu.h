@@ -16,11 +16,12 @@ size_t emv_apdu_build_select_ppse(uint8_t* buf);
  */
 size_t emv_apdu_build_select_aid(uint8_t* buf, const uint8_t* aid, uint8_t aid_len);
 
-/** Builds "GET PROCESSING OPTIONS" with a zero-filled PDOL value of the given length
- * (pdol_value_len may be 0 if the card presented no PDOL).
+/** Builds "GET PROCESSING OPTIONS" wrapping the given PDOL value bytes (already
+ * built by emv_pdol_build_value()) in the command template. pdol_value_len may be
+ * 0 if the card presented no PDOL.
  * @return number of bytes written to buf, or 0 if pdol_value_len is out of range.
  */
-size_t emv_apdu_build_gpo(uint8_t* buf, size_t pdol_value_len);
+size_t emv_apdu_build_gpo(uint8_t* buf, const uint8_t* pdol_value, size_t pdol_value_len);
 
 /** Builds "READ RECORD <record_num> from SFI <sfi>". */
 size_t emv_apdu_build_read_record(uint8_t* buf, uint8_t record_num, uint8_t sfi);

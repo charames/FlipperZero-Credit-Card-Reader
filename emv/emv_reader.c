@@ -1,6 +1,7 @@
 #include "emv_reader.h"
 #include "emv_apdu.h"
 #include "emv_tlv.h"
+#include "emv_pdol.h"
 #include "emv_aid_db.h"
 
 #include <nfc/protocols/iso14443_4a/iso14443_4a.h>
@@ -9,6 +10,9 @@
 
 #include <furi.h>
 #include <string.h>
+#include <stdio.h>
+
+#define TAG "EmvReader"
 
 #define EMV_MAX_CANDIDATE_AIDS (12)
 #define EMV_MAX_RECORD_READS (40)
@@ -172,6 +176,57 @@ static bool emv_field_visitor(const EmvTlv* tlv, void* context) {
     return true;
 }
 
+/* Records every leaf (non-constructed) TLV encountered, for the full raw-data
+ * view. Duplicate tags across different responses (e.g. the AIP appearing in
+ * both a SELECT response and the GPO response) are all kept, in read order,
+ * rather than deduplicated, since the point of this view is to show
+ * everything the card actually sent. */
+static bool emv_raw_field_visitor(const EmvTlv* tlv, void* context) {
+    EmvCardData* d = context;
+    if(tlv->constructed || tlv->length == 0) return true;
+    if(d->raw_field_count >= EMV_RAW_FIELD_MAX) return false;
+
+    EmvRawField* field = &d->raw_fields[d->raw_field_count++];
+    field->tag = tlv->tag;
+    field->length = (uint8_t)(tlv->length > 0xFF ? 0xFF : tlv->length);
+    size_t copy_len = tlv->length < EMV_RAW_VALUE_MAX ? tlv->length : EMV_RAW_VALUE_MAX;
+    memcpy(field->value, tlv->value, copy_len);
+
+    return true;
+}
+
+static void emv_log_hex(const char* label, const uint8_t* data, size_t len) {
+    char buf[100];
+    size_t n = len < 30 ? len : 30;
+    size_t pos = 0;
+    for(size_t i = 0; i < n && pos + 3 < sizeof(buf); i++) {
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%02X ", data[i]);
+    }
+    FURI_LOG_I(TAG, "%s (%zu bytes): %s%s", label, len, buf, len > n ? "..." : "");
+}
+
+#define EMV_TRANSIENT_ERROR_RETRIES (2)
+
+/* Communication-layer errors (protocol glitches, timeouts) are frequently just
+ * the card shifting slightly mid-read; a card that's truly gone (NotPresent)
+ * is not worth retrying. */
+static Iso14443_4aError emv_send_block_retrying(
+    Iso14443_4aPoller* poller,
+    const BitBuffer* tx,
+    BitBuffer* rx) {
+    Iso14443_4aError err = Iso14443_4aErrorNone;
+    for(uint8_t attempt = 0; attempt <= EMV_TRANSIENT_ERROR_RETRIES; attempt++) {
+        if(attempt > 0) {
+            FURI_LOG_I(TAG, "Retrying after %d (attempt %u)", err, attempt);
+            furi_delay_ms(20);
+        }
+        bit_buffer_reset(rx);
+        err = iso14443_4a_poller_send_block(poller, tx, rx);
+        if(err == Iso14443_4aErrorNone || err == Iso14443_4aErrorNotPresent) break;
+    }
+    return err;
+}
+
 /* Sends one APDU and follows a 61xx status word with GET RESPONSE as needed.
  * On success, out_data and out_len are set to the response body (SW1SW2 stripped);
  * these remain valid only until the next call to emv_transact. */
@@ -182,37 +237,53 @@ static bool emv_transact(
     size_t apdu_len,
     const uint8_t** out_data,
     size_t* out_len) {
+    emv_log_hex("TX", apdu, apdu_len);
+
     bit_buffer_reset(reader->tx);
     bit_buffer_copy_bytes(reader->tx, apdu, apdu_len);
-    bit_buffer_reset(reader->rx);
 
-    if(iso14443_4a_poller_send_block(poller, reader->tx, reader->rx) != Iso14443_4aErrorNone) {
+    Iso14443_4aError err = emv_send_block_retrying(poller, reader->tx, reader->rx);
+    if(err != Iso14443_4aErrorNone) {
+        FURI_LOG_W(TAG, "send_block failed: %d", err);
         return false;
     }
 
     size_t rx_len = bit_buffer_get_size_bytes(reader->rx);
-    if(rx_len < 2) return false;
+    if(rx_len < 2) {
+        FURI_LOG_W(TAG, "RX too short: %zu bytes", rx_len);
+        return false;
+    }
     const uint8_t* rx_data = bit_buffer_get_data(reader->rx);
+    emv_log_hex("RX", rx_data, rx_len);
     uint8_t sw1 = rx_data[rx_len - 2];
     uint8_t sw2 = rx_data[rx_len - 1];
 
     if(sw1 == 0x61) {
+        FURI_LOG_I(TAG, "61xx -> GET RESPONSE(%02X)", sw2);
         uint8_t gr[EMV_APDU_MAX_LEN];
         size_t gr_len = emv_apdu_build_get_response(gr, sw2);
         bit_buffer_reset(reader->tx);
         bit_buffer_copy_bytes(reader->tx, gr, gr_len);
-        bit_buffer_reset(reader->rx);
-        if(iso14443_4a_poller_send_block(poller, reader->tx, reader->rx) != Iso14443_4aErrorNone) {
+        err = emv_send_block_retrying(poller, reader->tx, reader->rx);
+        if(err != Iso14443_4aErrorNone) {
+            FURI_LOG_W(TAG, "GET RESPONSE send_block failed: %d", err);
             return false;
         }
         rx_len = bit_buffer_get_size_bytes(reader->rx);
-        if(rx_len < 2) return false;
+        if(rx_len < 2) {
+            FURI_LOG_W(TAG, "GET RESPONSE RX too short: %zu bytes", rx_len);
+            return false;
+        }
         rx_data = bit_buffer_get_data(reader->rx);
+        emv_log_hex("RX (GET RESPONSE)", rx_data, rx_len);
         sw1 = rx_data[rx_len - 2];
         sw2 = rx_data[rx_len - 1];
     }
 
-    if(sw1 != 0x90 || sw2 != 0x00) return false;
+    if(sw1 != 0x90 || sw2 != 0x00) {
+        FURI_LOG_I(TAG, "Non-success SW: %02X%02X", sw1, sw2);
+        return false;
+    }
 
     *out_data = rx_data;
     *out_len = rx_len - 2;
@@ -238,6 +309,7 @@ static bool emv_aid_collect_visitor(const EmvTlv* tlv, void* context) {
 
 static EmvReadResult
     emv_reader_perform_read(EmvReader* reader, Iso14443_4aPoller* poller, EmvCardData* data) {
+    FURI_LOG_I(TAG, "=== Starting EMV read ===");
     memset(data, 0, sizeof(*data));
 
     EmvAidCandidate candidates[EMV_MAX_CANDIDATE_AIDS];
@@ -256,7 +328,11 @@ static EmvReadResult
                 .max = EMV_MAX_CANDIDATE_AIDS - COUNT_OF(kFallbackAids),
             };
             emv_tlv_walk(resp, resp_len, emv_aid_collect_visitor, &col);
+            emv_tlv_walk(resp, resp_len, emv_raw_field_visitor, data);
             candidate_count = col.count;
+            FURI_LOG_I(TAG, "PPSE ok, %u AID(s) found", candidate_count);
+        } else {
+            FURI_LOG_I(TAG, "PPSE select failed");
         }
     }
 
@@ -265,69 +341,108 @@ static EmvReadResult
         i++) {
         candidates[candidate_count++] = kFallbackAids[i];
     }
+    FURI_LOG_I(TAG, "Trying %u candidate AID(s)", candidate_count);
 
     /* Step 3: try each candidate AID until one starts an EMV application. */
     bool app_started = false;
-    const uint8_t* afl_data = NULL;
+    /* Copied out of reader->rx (owned by emv_transact) before any further
+     * transaction, since reader->rx is reused/overwritten on every call. */
+    uint8_t afl_buf[EMV_APDU_MAX_LEN];
     size_t afl_len = 0;
+    EmvFieldCollector fc = {.data = data, .track2_len = 0};
 
     for(uint8_t i = 0; i < candidate_count && !app_started; i++) {
         const EmvAidCandidate* cand = &candidates[i];
+        emv_log_hex("Candidate AID", cand->aid, cand->len);
+        /* Only keep raw fields from the candidate that actually succeeds;
+         * roll back anything a failed attempt added so the raw-data view
+         * isn't cluttered with AID-probing noise. */
+        uint8_t raw_field_count_before = data->raw_field_count;
 
         uint8_t apdu[EMV_APDU_MAX_LEN];
         size_t apdu_len = emv_apdu_build_select_aid(apdu, cand->aid, cand->len);
         const uint8_t* select_resp;
         size_t select_resp_len;
         if(!emv_transact(reader, poller, apdu, apdu_len, &select_resp, &select_resp_len)) {
+            FURI_LOG_I(TAG, "SELECT AID failed, trying next candidate");
             continue;
         }
+        emv_tlv_walk(select_resp, select_resp_len, emv_raw_field_visitor, data);
 
+        uint8_t pdol_value[EMV_PDOL_MAX_VALUE_LEN];
         size_t pdol_value_len = 0;
         EmvTlv pdol_tlv;
         if(emv_tlv_find(select_resp, select_resp_len, 0x9F38, &pdol_tlv)) {
-            pdol_value_len = emv_dol_value_length(pdol_tlv.value, pdol_tlv.length);
-            if(pdol_value_len > 250) pdol_value_len = 0;
+            pdol_value_len =
+                emv_pdol_build_value(pdol_tlv.value, pdol_tlv.length, pdol_value, sizeof(pdol_value));
         }
+        emv_log_hex("PDOL value", pdol_value, pdol_value_len);
 
-        apdu_len = emv_apdu_build_gpo(apdu, pdol_value_len);
-        if(apdu_len == 0) continue;
+        apdu_len = emv_apdu_build_gpo(apdu, pdol_value, pdol_value_len);
+        if(apdu_len == 0) {
+            data->raw_field_count = raw_field_count_before;
+            continue;
+        }
 
         const uint8_t* gpo_resp;
         size_t gpo_resp_len;
         if(!emv_transact(reader, poller, apdu, apdu_len, &gpo_resp, &gpo_resp_len)) {
+            FURI_LOG_I(TAG, "GPO failed, trying next candidate");
+            data->raw_field_count = raw_field_count_before;
             continue;
         }
+        emv_tlv_walk(gpo_resp, gpo_resp_len, emv_raw_field_visitor, data);
 
         memcpy(data->aid, cand->aid, cand->len);
         data->aid_len = cand->len;
         data->aid_found = true;
         emv_aid_db_lookup(data->aid, data->aid_len, &data->aid_name);
         app_started = true;
+        FURI_LOG_I(TAG, "App started: %s", data->aid_name ? data->aid_name : "(unknown AID)");
+
+        /* Some cards include PAN/Track2/name directly in the GPO response
+         * (format 2, tag 77) alongside the AIP/AFL, so check here first -
+         * before ever touching the AFL, which may point at records the card
+         * doesn't let us reach if the field drops mid-read. */
+        emv_tlv_walk(gpo_resp, gpo_resp_len, emv_field_visitor, &fc);
 
         EmvTlv fmt1;
+        const uint8_t* afl_src = NULL;
         if(emv_tlv_find(gpo_resp, gpo_resp_len, 0x80, &fmt1) && fmt1.length > 2) {
-            afl_data = fmt1.value + 2;
+            afl_src = fmt1.value + 2;
             afl_len = fmt1.length - 2;
+            FURI_LOG_I(TAG, "AFL via fmt1 (tag 80), %zu bytes", afl_len);
         } else {
             EmvTlv fmt2;
             if(emv_tlv_find(gpo_resp, gpo_resp_len, 0x94, &fmt2)) {
-                afl_data = fmt2.value;
+                afl_src = fmt2.value;
                 afl_len = fmt2.length;
+                FURI_LOG_I(TAG, "AFL via fmt2 (tag 94), %zu bytes", afl_len);
+            } else {
+                FURI_LOG_W(TAG, "No AFL found in GPO response");
             }
+        }
+        if(afl_src && afl_len <= sizeof(afl_buf)) {
+            memcpy(afl_buf, afl_src, afl_len);
+        } else {
+            afl_len = 0;
         }
     }
 
-    if(!app_started) return EmvReadResultProtocolError;
+    if(!app_started) {
+        FURI_LOG_W(TAG, "No candidate AID could be started");
+        return EmvReadResultProtocolError;
+    }
 
-    /* Step 4: read every record listed in the AFL and pull out the fields we want. */
-    EmvFieldCollector fc = {.data = data, .track2_len = 0};
+    /* Step 4: if the GPO response didn't already give us a PAN, fall back to
+     * reading every record listed in the AFL. */
     uint16_t reads_done = 0;
 
-    if(afl_data && afl_len % 4 == 0) {
+    if(!data->pan_found && afl_len > 0 && afl_len % 4 == 0) {
         for(size_t g = 0; g + 4 <= afl_len && reads_done < EMV_MAX_RECORD_READS; g += 4) {
-            uint8_t sfi = afl_data[g] >> 3;
-            uint8_t first_rec = afl_data[g + 1];
-            uint8_t last_rec = afl_data[g + 2];
+            uint8_t sfi = afl_buf[g] >> 3;
+            uint8_t first_rec = afl_buf[g + 1];
+            uint8_t last_rec = afl_buf[g + 2];
             if(sfi == 0 || first_rec == 0 || last_rec < first_rec) continue;
 
             for(uint8_t rec = first_rec; rec <= last_rec && reads_done < EMV_MAX_RECORD_READS;
@@ -341,6 +456,7 @@ static EmvReadResult
                     continue;
                 }
                 emv_tlv_walk(rec_resp, rec_resp_len, emv_field_visitor, &fc);
+                emv_tlv_walk(rec_resp, rec_resp_len, emv_raw_field_visitor, data);
             }
         }
     }
@@ -348,6 +464,12 @@ static EmvReadResult
     if(!data->pan_found && fc.track2_len > 0) {
         emv_track2_decode(fc.track2, fc.track2_len, data);
     }
+
+    FURI_LOG_I(
+        TAG,
+        "Read done: %u record(s) read, pan_found=%d",
+        reads_done,
+        data->pan_found);
 
     return data->pan_found ? EmvReadResultSuccess : EmvReadResultNoPan;
 }
